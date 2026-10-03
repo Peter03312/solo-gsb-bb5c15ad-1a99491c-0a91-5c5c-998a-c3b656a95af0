@@ -347,6 +347,11 @@ curl -s -X DELETE http://localhost:3000/api/releases/1
   **分配过该卷的已出货单全部标记为 `PENDING_REVIEW`（待评估）并显示逐卷原因**；
   即使过敏原集合后来恢复一致，单据**也不会自动恢复**为已出货（需线下质量评估，系统不提供自动回改）。
 - 卷停用后，其**尚未分配的已贴张数也不得再出货**（出货只接受 `ACTIVE` 卷，余额查询中停卷可出货恒为 0）。
+- **质量隔离令生效期间读侧统一为零**：批次被任一生效令覆盖时，批次余额接口、整页状态（`/api/state`）
+  与页面出货入口中的**逐卷可出货量及批次合计一律按 0 呈现**，页面不可选择该批次的卷分配出货
+  （与确认出货的 `409 BATCH_QUARANTINED` 拒绝语义一致）；**已贴用数、已分配数、卷状态与历史出货记录
+  均保持原值**，待评估出货单仍占用其原分配量。解除隔离或流向更正使批次**脱离全部生效令**后，
+  自动恢复按「未停用卷剩余已贴用量」计算；停用卷始终为 0。
 - 可查询**批次可出货余额**（该批所有未停用卷的「已贴用 − 累计已分配」之和）与**出货单状态/明细**。
 - 已出货/待评估单据占用的分配数量始终计入「累计已分配」，不会因单据转待评估而退回重复使用。
 
@@ -357,9 +362,9 @@ curl -s -X DELETE http://localhost:3000/api/releases/1
 | `POST /api/shipments` | 出货确认（整单事务化），返回出货单（含 `shipment_code`、`status`、各卷快照 `items`） |
 | `GET /api/shipments` | 出货单列表，可按 `?batch_id=`、`?status=SHIPPED|PENDING_REVIEW` 过滤 |
 | `GET /api/shipments/:idOrCode` | 单张出货单（数字 id 或 `SHIP-0001` 单号），含状态、原因与明细快照 |
-| `GET /api/batches/:id/shipment-balance` | 单个批次可出货余额（逐卷列出 印量/已贴/作废/已分配/可出） |
-| `GET /api/shipment-balances` | 全部批次可出货余额 |
-| `GET /api/state` | 顶层新增 `shipments` 数组；`label_rolls` 每项另含 `allocated_qty`（累计已分配）与 `shippable_qty`（可出货余额） |
+| `GET /api/batches/:id/shipment-balance` | 单个批次可出货余额（逐卷列出 印量/已贴/作废/已分配/可出）；批次受控于任一隔离令时 `quarantined:true` 且逐卷/合计可出货均为 0，贴用/分配/卷状态原值返回 |
+| `GET /api/shipment-balances` | 全部批次可出货余额（受控批次同样 `quarantined:true`、可出货为 0） |
+| `GET /api/state` | 顶层新增 `shipments` 数组；`label_rolls` 每项另含 `allocated_qty`（累计已分配）与 `shippable_qty`（可出货余额；所属批次受控时为 0，贴用/分配/状态原值不变） |
 | 事件 `POST/PUT/DELETE`、原料 `PUT`、换线 `apply`、放行 `DELETE` | 响应形状不变，另附 `pending_shipments`（本次新转入待评估的出货单） |
 | 换线 `preview` 的 `diff` | 另含 `shipments_will_pending`（应用后将转待评估的出货单）与 `summary.shipments_will_pending` |
 
@@ -432,6 +437,25 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001
 #      review_reason:"出货所用标签卷已停用，相关已出货标签需质量评估：卷 LABEL-0001：批次过敏原集合已改变（新增：花生）…",
 #      items:[ ...快照仍在... ] }
 # 该卷尚未分配的已贴张数此时余额为 0，不可再出货；撤销改动集合恢复后单据仍为 PENDING_REVIEW。
+
+# 7) 质量隔离令生效：余额读侧与出货入口统一为 0（原值保留）
+#    对 BATCH-003 关联的供应批号（演示库为全脂奶粉 SUP-MILK-20260926-B/#2）签发隔离令后：
+curl -s -X POST http://localhost:3000/api/quarantine-orders \
+  -H 'Content-Type: application/json' -d '{
+    "lot_id": 2, "reason": "供应商通报该批可能混入异常原料，隔离待查",
+    "issued_by": "质检员-王敏"
+  }' >/dev/null
+curl -s http://localhost:3000/api/batches/3/shipment-balance
+# -> { batch_id:3, batch_code:"BATCH-003", quarantined:true,
+#      shippable_qty:0,                       # 批次合计为 0
+#      applied_qty:120, allocated_qty:100,   # 已贴用/已分配保持原值（待评估单仍占用 100）
+#      rolls:[{ roll_code:"LABEL-0001", status:"ACTIVE", active:true,
+#               applied_qty:120, allocated_qty:100, available_qty:0 }] }  # 逐卷可出货为 0
+curl -s http://localhost:3000/api/shipment-balances   # 受控批次同样 quarantined:true、可出货 0
+# 页面“包装出货”页：该批次卡片显示“质量隔离令生效中，暂停出货”，不可选择其卷分配出货；
+# 此时仍提交确认出货 -> 409 BATCH_QUARANTINED（语义不变，整单不占用数量）。
+# 解除隔离或流向更正使批次脱离全部生效令后：quarantined:false，
+# 可出货量恢复为未停用卷的“已贴用 − 累计已分配”（停用卷始终为 0）。
 ```
 
 | 场景 | HTTP | `code` |
@@ -1027,6 +1051,11 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
   换线预演的 `diff` 另含 `quarantine_will_control/quarantine_will_release`）。
 - **受控批次**（处于任一隔离令生效范围）：
   - **不得登记放行、不得登记标签卷、不得确认出货**（`409 BATCH_QUARANTINED`）；
+  - **读侧可出货量统一为零**：批次余额接口（`/api/batches/:id/shipment-balance`、
+    `/api/shipment-balances`）与整页状态 `/api/state` 中，该批次**逐卷可出货量及批次合计均为 0**，
+    页面“包装出货”入口**不可选择该批次的卷分配出货**；响应字段保持不变
+    （余额响应另带 `quarantined` 标记），**已贴用数、已分配数、卷状态与历史出货记录保持原值**，
+    待评估单仍占用原分配量；
   - **已有标签卷暂停贴用但不永久停用**：核销贴用/作废 `409 ROLL_QUARANTINED`，
     卷保持 `ACTIVE`，脱离全部生效令后自动恢复贴用；
   - **关联已出货单转待评估**（`PENDING_REVIEW`，终态不自动恢复），并推进该单状态版本；
@@ -1035,8 +1064,9 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
     提交 `CONTINUE` 被 `409 CONTINUE_NOT_ALLOWED` 拒绝，`RECALL` 正常落账。
 - **解除**：必须录入**解除原因**与**操作人**（时间可选）；解除为终态
   （重复解除 `409 QUARANTINE_NOT_ACTIVE`），解除时的生效范围快照留痕（`lifted_scope`）。
-  **批次脱离所有生效令后**才恢复放行/标签卷/出货登记与卷贴用（多张令覆盖同一批次时，
-  解除其中一张不足以恢复）；**待评估单及历史处置结论不自动恢复**。
+  **批次脱离所有生效令后**才恢复放行/标签卷/出货登记与卷贴用，可出货余额随之恢复按
+  「未停用卷剩余已贴用量」计算（多张令覆盖同一批次时，解除其中一张不足以恢复；停用卷始终为 0）；
+  **待评估单及历史处置结论不自动恢复**。
 - **原子性**：签发、解除和范围变化与关联业务状态更新（出货单转待评估、结论转需重评）
   在**同一事务**内完成；任一环节失败整体回滚。
 - **台账只增不改**：隔离令永不删除；已签发过隔离令（含已解除历史令）的批号不可删除
@@ -1050,7 +1080,8 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
 | `GET /api/quarantine-orders` | 隔离令列表，可 `?status=ACTIVE\|LIFTED`、`?lot_id=` 过滤（范围只带批次清单） |
 | `GET /api/quarantine-orders/:id` | 单条隔离令：当前生效范围、逐批次传播依据、关联出货单；已解除令含 `lifted_scope` 快照 |
 | `POST /api/quarantine-orders/:id/lift` | 解除隔离令（`lifted_by`、`lift_reason`、`lifted_at?`），返回脱离受控的批次 |
-| `GET /api/state` | 顶层新增 `quarantine_orders`；`batches[]` 新增 `quarantined`/`quarantine_orders`；`label_rolls[]` 新增 `quarantine_paused`；`materials[].lots[]` 新增 `quarantine_active`/`active_quarantine_order`；`shipments[]` 新增 `batch_quarantined` |
+| `GET /api/state` | 顶层新增 `quarantine_orders`；`batches[]` 新增 `quarantined`/`quarantine_orders`；`label_rolls[]` 新增 `quarantine_paused`，且所属批次受控时 `shippable_qty` 为 0（贴用/分配/状态原值不变）；`materials[].lots[]` 新增 `quarantine_active`/`active_quarantine_order`；`shipments[]` 新增 `batch_quarantined` |
+| `GET /api/batches/:id/shipment-balance`、`GET /api/shipment-balances` | 受控批次余额响应 `quarantined:true`、逐卷 `available_qty` 与批次 `shippable_qty` 均为 0；既有字段（含已贴用/已分配/卷状态）与批次不存在时的错误保持不变 |
 | `POST /api/releases`、`POST /api/label-rolls`、`POST /api/shipments` | 受控批次明确拒绝（`409 BATCH_QUARANTINED`） |
 | `POST /api/label-rolls/:id/consume` | 受控批次的卷暂停贴用（`409 ROLL_QUARANTINED`，不永久停用） |
 | `GET /api/shipments/:id/evaluation` | `current_state`/`conditions` 新增 `batch_quarantined`/`quarantine_orders`，准予判定含“未受隔离”条件 |
@@ -1102,6 +1133,14 @@ curl -s -X POST http://localhost:3000/api/releases \
 curl -s -X POST http://localhost:3000/api/label-rolls/1/consume \
   -H 'Content-Type: application/json' -d '{"expected_revision":2,"applied":1,"voided":0}'
 #    LABEL-0001 保持 ACTIVE（quarantine_paused=true），不永久停用
+
+# 3b) 读侧统一：余额接口/整页状态的逐卷与合计可出货量均为 0，原值保留
+curl -s http://localhost:3000/api/batches/3/shipment-balance
+# -> { quarantined:true, shippable_qty:0, applied_qty:120, allocated_qty:100,
+#      rolls:[{ roll_code:"LABEL-0001", status:"ACTIVE",
+#               applied_qty:120, allocated_qty:100, available_qty:0 }] }
+#    /api/state 中该卷 shippable_qty 同样为 0（已贴/已分配/ACTIVE 不变）；
+#    页面“包装出货”不提供 BATCH-003 的卷分配入口；历史出货 SHIP-0001 记录保留。
 
 # 4) 隔离期间只能召回：评估视图 quarantined=true，CONTINUE 被拒，RECALL 落账
 VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
@@ -1185,7 +1224,7 @@ npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯
 npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清指定过敏原/重算联动（放行/卷/出货/处置）/追溯按过敏原保留设备传播/全清与无过敏原原料/换线预演确认
 npm run test:backfill     # 端到端验证断网日志整包补录：整包事务/包内引用/幂等重试/外部记录号复用与冲突/重算联动（放行/卷/出货/处置）/对账（OK/MISMATCH/DELETED）/旧接口兼容
 npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调整/取消/查询、左闭右开与相邻允许、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗
-npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重复拒绝、生效范围（确定命中+批号未知无法排除）与传播依据、受控约束（放行/卷/出货/暂停贴用）、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复
+npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重复拒绝、生效范围（确定命中+批号未知无法排除）与传播依据、受控约束（放行/卷/出货/暂停贴用/读侧可出货量统一为 0）、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复（余额按未停用卷剩余已贴量恢复，停用卷恒 0）
 ```
 
 ## 访问地址与端口
@@ -1219,6 +1258,8 @@ npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重�
   可在此包装前登记新卷、按修订号核销贴用/作废；停用卷红色标注并给出具体停用原因，
   已贴数量标注“待复核”、余量标注“冻结”。
 - **包装出货**：展示各批次**可出货余额**（未停用卷的「已贴用 − 累计已分配」，点击卡片即可出货）；
+  批次被任一质量隔离生效令覆盖时，逐卷与合计可出货量显示为 0 且卡片标注“质量隔离令生效中，暂停出货”，
+  出货弹窗不提供该批次的卷分配（已贴用/已分配/卷状态与历史出货记录照常展示）。
   可在此录入批次、正整数出货量、各卷分配张数与操作人做整单出货确认（失败整单拒绝、不占数量），
   并列出全部出货单及其状态、逐卷明细快照（放行标识 / 过敏原 / 卷号 / 修订号）；
   **待评估**单据黄色标注并给出逐卷停用原因，不自动恢复；
@@ -1256,7 +1297,7 @@ server/
   downtime.js    # 设备检修停机窗口：登记/调整/取消/查询（左闭右开、同设备不重叠相邻允许、覆盖事件整次拒绝）；事件落窗核对供全量校验复用
   recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
-  shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额、待评估联动（不自动恢复）
+  shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额（受控批次逐卷/合计按 0、原值保留）、待评估联动（不自动恢复）
   evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
   trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单

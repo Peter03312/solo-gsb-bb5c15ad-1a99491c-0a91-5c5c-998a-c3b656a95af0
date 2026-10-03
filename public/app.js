@@ -239,18 +239,21 @@ function renderBalances() {
 
   const cards = state.batches.map((b) => {
     const rolls = byBatch.get(b.id) || [];
-    const shippable = rolls
+    // 质量隔离令：批次被任一生效令覆盖时，逐卷可出货量与合计一律按 0（与读侧一致），
+    // 已贴用/已分配/卷状态保持原值展示。
+    const shippable = b.quarantined ? 0 : rolls
       .filter((r) => r.active)
       .reduce((s, r) => s + Math.max(r.applied_qty - (r.allocated_qty || 0), 0), 0);
     const applied = rolls.reduce((s, r) => s + r.applied_qty, 0);
     const allocated = rolls.reduce((s, r) => s + (r.allocated_qty || 0), 0);
     const canShip = shippable > 0;
     return `
-    <div class="balance-card ${canShip ? '' : 'zero'}" onclick="openShipment(${b.id})">
+    <div class="balance-card ${canShip ? '' : 'zero'}">
       <div class="balance-head">
         <span class="batch-code">${esc(b.code)}</span>
         <span class="badge ${canShip ? 'active' : 'invalid'}">可出货 ${shippable}</span>
       </div>
+      ${b.quarantined ? `<div class="tag danger" style="margin:4px 0">质量隔离令生效中，暂停出货（可出货量按 0，确认出货将被拒绝）</div>` : ''}
       <div class="balance-nums">
         <span>已贴用 <b>${applied}</b></span>
         <span>已分配 <b>${allocated}</b></span>
@@ -258,11 +261,13 @@ function renderBalances() {
       </div>
       <div class="balance-rolls">
         ${rolls.length ? rolls.map((r) => {
-          const avail = r.active ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0) : 0;
+          const avail = (!b.quarantined && r.active)
+            ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0) : 0;
           return `<span class="mini-roll ${r.active ? '' : 'off'}">
             ${esc(r.roll_code)}：${r.active ? `可出 ${avail}` : '已停用'}</span>`;
         }).join(' ') : '<span class="batch-meta">无标签卷</span>'}
       </div>
+      ${canShip ? `<button type="button" class="btn small primary" onclick="openShipment(${b.id})">分配出货</button>` : ''}
     </div>`;
   }).join('');
 
@@ -911,11 +916,14 @@ $('#rollList').addEventListener('submit', async (e) => {
 
 // ================= 包装出货 =================
 function shippableRolls(batchId) {
+  const b = state.batches.find((x) => x.id === batchId);
+  // 质量隔离令：批次被任一生效令覆盖时，页面不提供该批次任何卷的出货分配
+  // （逐卷可出货量读侧已为 0，这里再按批次受控状态显式排除）。
+  if (!b || b.quarantined) return [];
   return (state.label_rolls || [])
     .filter((r) => r.batch_id === batchId && r.active)
     .filter((r) => {
-      const b = state.batches.find((x) => x.id === batchId);
-      const rel = b && (b.releases || []).find((x) => x.id === r.release_id && x.status === 'ACTIVE');
+      const rel = (b.releases || []).find((x) => x.id === r.release_id && x.status === 'ACTIVE');
       return Boolean(rel);
     })
     .filter((r) => r.shippable_qty > 0);
@@ -933,6 +941,15 @@ function fillShipmentModal(batchId) {
 
 function renderShipAllocationRows(batchId) {
   const rolls = batchId ? shippableRolls(batchId) : [];
+  const batch = state.batches.find((b) => b.id === batchId);
+  if (batch && batch.quarantine_orders && batch.quarantine_orders.length) {
+    const names = batch.quarantine_orders
+      .map((o) => `${o.order_code}（${o.material_name} 批号 ${o.lot_code}）`).join('、');
+    $('#shipRollsHint').innerHTML =
+      `<span class="tag danger">批次 ${esc(batch.code)} 处于质量隔离令生效范围（${esc(names)}），隔离期间不可出货；逐卷可出货量按 0，解除隔离或流向更正脱离全部生效令后恢复</span>`;
+    $('#shipAllocations').innerHTML = '';
+    return;
+  }
   if (!rolls.length) {
     $('#shipRollsHint').innerHTML = '<span class="tag danger">该批次暂无可出货标签（需要未停用、绑定有效放行且有已贴用余额的卷）</span>';
     $('#shipAllocations').innerHTML = '';

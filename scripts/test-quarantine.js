@@ -187,6 +187,39 @@ async function main() {
     check('受控批次确认出货 → 409 BATCH_QUARANTINED',
       r.status === 409 && r.json.code === 'BATCH_QUARANTINED', r.json);
 
+    // ---------- 2b. 读侧统一：余额接口/整页状态逐卷与合计均为 0，原值保留 ----------
+    console.log('2b) 受控期间读侧统一：逐卷可出货量及批次合计为 0；贴用/分配/卷状态/历史出货不变');
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('批次余额标记 quarantined 且合计 0',
+      r.status === 200 && r.json.quarantined === true && r.json.shippable_qty === 0, r.json);
+    const balRoll = r.json.rolls.find((x) => x.roll_code === 'LABEL-0001');
+    check('逐卷可出货量 0，但已贴 120 / 已分配 100 / 状态 ACTIVE 原值保留',
+      balRoll.available_qty === 0 && balRoll.applied_qty === 120 &&
+      balRoll.allocated_qty === 100 && balRoll.status === 'ACTIVE' && balRoll.active === true,
+      balRoll);
+    check('批次已贴用 120 / 已分配 100（待评估单仍占用原分配量）',
+      r.json.applied_qty === 120 && r.json.allocated_qty === 100, r.json);
+    r = await api('GET', '/api/shipment-balances');
+    const allB3 = r.json.find((x) => x.batch_id === B3);
+    const allB1 = r.json.find((x) => x.batch_id === B2);
+    check('全部批次余额：受控批次合计 0 且标记 quarantined',
+      r.status === 200 && allB3.shippable_qty === 0 && allB3.quarantined === true &&
+      allB1.shippable_qty === 0 && allB1.quarantined === true, { allB1, allB3 });
+    r = await api('GET', '/api/batches/999999/shipment-balance');
+    check('受控读侧改动下批次不存在仍 400 BATCH_NOT_FOUND',
+      r.status === 400 && r.json.code === 'BATCH_NOT_FOUND', r.json);
+    const stBal = await state();
+    const stateRoll = stBal.label_rolls.find((x) => x.roll_code === 'LABEL-0001');
+    check('整页状态：逐卷 shippable_qty=0，贴用/分配/卷状态不变且暂停贴用标记保留',
+      stateRoll.shippable_qty === 0 && stateRoll.applied_qty === 120 &&
+      stateRoll.allocated_qty === 100 && stateRoll.status === 'ACTIVE' &&
+      stateRoll.quarantine_paused === true, stateRoll);
+    const shipHist = stBal.shipments.find((x) => x.shipment_code === 'SHIP-0001');
+    check('历史出货记录保留（SHIP-0001 待评估、明细 100 张仍在、批次标记受控）',
+      shipHist.status === 'PENDING_REVIEW' && shipHist.allocated_qty === 100 &&
+      shipHist.items.length === 1 && shipHist.items[0].qty === 100 &&
+      shipHist.batch_quarantined === true, shipHist);
+
     // ---------- 3. 隔离期间只能召回 ----------
     console.log('3) 评估视图：隔离中只能召回，CONTINUE 被拒、RECALL 落账');
     r = await api('GET', '/api/shipments/SHIP-0001/evaluation');
@@ -269,6 +302,10 @@ async function main() {
     r = await api('POST', '/api/releases',
       { batch_id: B2, released_at: '2026-10-02T10:00', released_by: '王敏' });
     check('仍被奶令覆盖：BATCH-002 不得放行', r.status === 409);
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('只解除蛋令、奶令仍覆盖：余额仍为 0（须脱离全部生效令才恢复）',
+      r.json.quarantined === true && r.json.shippable_qty === 0 &&
+      r.json.rolls[0].available_qty === 0, r.json);
 
     r = await api('POST', `/api/quarantine-orders/${QUAR1}/lift`, {
       lifted_by: '质检主管-刘芳', lift_reason: '供应商复检合格，解除隔离',
@@ -300,6 +337,16 @@ async function main() {
     r = await api('POST', `/api/label-rolls/${LABEL1}/consume`,
       { expected_revision: 2, applied: 1, voided: 0, used_by: '包装工-赵强' });
     check('卷自动恢复贴用（不永久停用）', r.status === 200 && r.json.revision === 3, r.json);
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('脱离全部生效令后余额恢复：quarantined=false、可出货 21（已贴 121 − 已分配 100）',
+      r.status === 200 && r.json.quarantined === false && r.json.shippable_qty === 21 &&
+      r.json.applied_qty === 121 && r.json.allocated_qty === 100 &&
+      r.json.rolls[0].available_qty === 21 && r.json.rolls[0].status === 'ACTIVE', r.json);
+    const stRel = await state();
+    check('整页状态同步恢复逐卷可出货量（21），暂停贴用标记撤销',
+      stRel.label_rolls.find((x) => x.id === LABEL1).shippable_qty === 21 &&
+      stRel.label_rolls.find((x) => x.id === LABEL1).quarantine_paused === false,
+      stRel.label_rolls.find((x) => x.id === LABEL1));
     r = await api('GET', '/api/shipments/SHIP-0001');
     check('待评估单不自动恢复（仍 PENDING_REVIEW，召回结论保留）',
       r.json.status === 'PENDING_REVIEW' &&
@@ -397,6 +444,11 @@ async function main() {
     r = await api('POST', '/api/releases',
       { batch_id: B_Q1, released_at: '2026-10-03T12:00', released_by: '王敏' });
     check('解除后 BATCH-Q1 恢复放行登记', r.status === 200, r.json);
+    r = await api('GET', `/api/batches/${B_Q1}/shipment-balance`);
+    check('脱离生效令后批次不再受控，但停用卷可出货始终 0（待评估单仍占用 5 张）',
+      r.json.quarantined === false && r.json.shippable_qty === 0 &&
+      r.json.rolls[0].status === 'RETIRED' && r.json.rolls[0].available_qty === 0 &&
+      r.json.rolls[0].applied_qty === 10 && r.json.rolls[0].allocated_qty === 5, r.json);
 
     // ---------- 7. 台账与查询 ----------
     console.log('7) 台账：有隔离令的批号不可删除；列表过滤；单条 404');

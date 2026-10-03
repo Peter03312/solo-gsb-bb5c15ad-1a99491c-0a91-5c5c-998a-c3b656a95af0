@@ -211,7 +211,9 @@ app.get('/api/state', (req, res) => {
     release_by: r.release_by,
     allocated_qty: r.allocated_qty || 0,
     // 可出货余额：仅未停用卷的“已贴用 - 累计已分配”；停卷余量冻结不可出货。
-    shippable_qty: r.status === 'ACTIVE'
+    // 质量隔离令：所属批次被任一生效令覆盖时逐卷可出货量按 0（与余额接口/出货入口一致），
+    // 已贴用数、已分配数与卷状态均保留原值。
+    shippable_qty: r.status === 'ACTIVE' && !quarByBatch.has(r.batch_id)
       ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
       : 0,
     // 质量隔离令：所属批次受控时暂停贴用（不永久停用；脱离全部生效令后自动恢复）。

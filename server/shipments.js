@@ -17,6 +17,11 @@
 //   分配过该卷的已出货单全部置为 PENDING_REVIEW 并记录原因；
 //   已 PENDING_REVIEW 的单据不会因后续任何更正恢复为 SHIPPED。
 //   卷停用后其尚未分配的已贴张数自然不可再出货（出货只接受 ACTIVE 卷）。
+//
+// 质量隔离令读侧统一：批次被任一生效令覆盖时，批次余额接口、整页状态与页面出货入口
+//   的逐卷可出货量及批次合计一律为 0（卷不停用、贴用/分配/历史出货原值保留），
+//   与确认出货的 BATCH_QUARANTINED 拒绝语义一致；脱离全部生效令后按未停用卷剩余
+//   已贴用量恢复，停用卷始终为 0，待评估单仍占用原分配量。
 
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 
@@ -401,9 +406,13 @@ function formatShipment(s, db) {
 // ---------- 批次可出货余额 ----------
 // 可出货余额 = 该批次所有“未停用卷”的 max(已贴用 - 累计已分配, 0) 之和。
 // 停卷尚未分配的已贴张数因只接受 ACTIVE 卷而自然排除（不可再出货）。
+// 质量隔离令：批次被任一生效令覆盖时，逐卷可出货量与批次合计一律按 0 呈现，
+// 与确认出货的拒绝语义、整页状态和页面出货入口保持一致；已贴用数、已分配数、
+// 卷状态与历史出货记录均不改（待评估单仍占用原分配量）；脱离全部生效令后自动恢复。
 function batchBalance(db, batchId) {
   const batch = db.prepare('SELECT id, code FROM batches WHERE id = ?').get(batchId);
   if (!batch) throw new ShipmentError('BATCH_NOT_FOUND', '批次不存在');
+  const controlled = require('./quarantine').isBatchControlled(db, batchId);
   const rollRows = db.prepare(
     `SELECT lr.id, lr.roll_code, lr.status, lr.print_qty, lr.applied_qty,
             lr.void_qty, lr.revision,
@@ -415,7 +424,8 @@ function batchBalance(db, batchId) {
   ).all(batchId);
 
   const rolls = rollRows.map((r) => {
-    const available = r.status === 'ACTIVE'
+    // 受控批次逐卷可出货量一律 0（卷本身不停用；贴用/分配/状态原值展示）。
+    const available = !controlled && r.status === 'ACTIVE'
       ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
       : 0;
     return {
@@ -434,6 +444,8 @@ function batchBalance(db, batchId) {
   return {
     batch_id: batch.id,
     batch_code: batch.code,
+    // 批次当前是否被任一质量隔离生效令覆盖；受控时 shippable_qty 恒为 0。
+    quarantined: controlled,
     shippable_qty: rolls.reduce((s, r) => s + r.available_qty, 0),
     applied_qty: rolls.reduce((s, r) => s + r.applied_qty, 0),
     allocated_qty: rolls.reduce((s, r) => s + r.allocated_qty, 0),
