@@ -239,9 +239,11 @@ function renderBalances() {
 
   const cards = state.batches.map((b) => {
     const rolls = byBatch.get(b.id) || [];
-    const shippable = rolls
-      .filter((r) => r.active)
-      .reduce((s, r) => s + Math.max(r.applied_qty - (r.allocated_qty || 0), 0), 0);
+    // 可出货合计直接采用服务端逐卷 shippable_qty（已统一：停用卷与受控批次恒为 0）。
+    const quar = Boolean(b.quarantined);
+    const quarTitles = (b.quarantine_orders || [])
+      .map((o) => `${o.order_code}（${o.material_name} 批号 ${o.lot_code}）`).join('、');
+    const shippable = rolls.reduce((s, r) => s + (r.shippable_qty || 0), 0);
     const applied = rolls.reduce((s, r) => s + r.applied_qty, 0);
     const allocated = rolls.reduce((s, r) => s + (r.allocated_qty || 0), 0);
     const canShip = shippable > 0;
@@ -250,7 +252,9 @@ function renderBalances() {
       <div class="balance-head">
         <span class="batch-code">${esc(b.code)}</span>
         <span class="badge ${canShip ? 'active' : 'invalid'}">可出货 ${shippable}</span>
+        ${quar ? `<span class="badge invalid" title="脱离全部生效令后恢复可出货">质量隔离中</span>` : ''}
       </div>
+      ${quar ? `<div class="batch-meta">处于质量隔离令生效范围：${esc(quarTitles)}；隔离期间逐卷可出货为 0，不可分配出货。</div>` : ''}
       <div class="balance-nums">
         <span>已贴用 <b>${applied}</b></span>
         <span>已分配 <b>${allocated}</b></span>
@@ -258,9 +262,10 @@ function renderBalances() {
       </div>
       <div class="balance-rolls">
         ${rolls.length ? rolls.map((r) => {
-          const avail = r.active ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0) : 0;
-          return `<span class="mini-roll ${r.active ? '' : 'off'}">
-            ${esc(r.roll_code)}：${r.active ? `可出 ${avail}` : '已停用'}</span>`;
+          const avail = r.shippable_qty || 0;
+          const label = !r.active ? '已停用' : (quar ? '隔离中·可出 0' : `可出 ${avail}`);
+          return `<span class="mini-roll ${r.active && !quar ? '' : 'off'}">
+            ${esc(r.roll_code)}：${label}</span>`;
         }).join(' ') : '<span class="batch-meta">无标签卷</span>'}
       </div>
     </div>`;
@@ -923,18 +928,22 @@ function shippableRolls(batchId) {
 
 function fillShipmentModal(batchId) {
   const f = $('#shipmentForm');
+  // 只有存在可出货卷的批次才可选择（受控批次逐卷可出货为 0，不会出现在选项中）。
   const batches = state.batches.filter((b) => shippableRolls(b.id).length > 0);
+  const target = batches.some((b) => b.id === batchId)
+    ? batchId
+    : (batches[0] && batches[0].id);
   $('#shipBatch').innerHTML = batches.length
     ? batches.map((b) =>
-      `<option value="${b.id}" ${b.id === batchId ? 'selected' : ''}>${esc(b.code)}</option>`).join('')
+      `<option value="${b.id}" ${b.id === target ? 'selected' : ''}>${esc(b.code)}</option>`).join('')
     : '';
-  renderShipAllocationRows(batchId || (batches[0] && batches[0].id));
+  renderShipAllocationRows(target);
 }
 
 function renderShipAllocationRows(batchId) {
   const rolls = batchId ? shippableRolls(batchId) : [];
   if (!rolls.length) {
-    $('#shipRollsHint').innerHTML = '<span class="tag danger">该批次暂无可出货标签（需要未停用、绑定有效放行且有已贴用余额的卷）</span>';
+    $('#shipRollsHint').innerHTML = '<span class="tag danger">该批次暂无可出货标签（需要未停用、未受质量隔离令控制、绑定有效放行且有已贴用余额的卷）</span>';
     $('#shipAllocations').innerHTML = '';
     return;
   }

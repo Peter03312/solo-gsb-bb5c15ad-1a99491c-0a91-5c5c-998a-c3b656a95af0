@@ -401,9 +401,17 @@ function formatShipment(s, db) {
 // ---------- 批次可出货余额 ----------
 // 可出货余额 = 该批次所有“未停用卷”的 max(已贴用 - 累计已分配, 0) 之和。
 // 停卷尚未分配的已贴张数因只接受 ACTIVE 卷而自然排除（不可再出货）。
+// 质量隔离令：任一生效令覆盖该批次时，逐卷可出货量与批次合计均为 0
+// （与确认出货的 BATCH_QUARANTINED 拒绝保持同一判定，避免读侧误导出货）；
+// 已贴用数、已分配数、卷状态保持原值。解除隔离或流向更正使批次脱离全部
+// 生效令后，恢复按未停用卷“已贴用 − 累计已分配”计算（停用卷始终为 0，
+// 待评估单仍占用其原分配量）。
 function batchBalance(db, batchId) {
   const batch = db.prepare('SELECT id, code FROM batches WHERE id = ?').get(batchId);
   if (!batch) throw new ShipmentError('BATCH_NOT_FOUND', '批次不存在');
+  const quarantine = require('./quarantine');
+  const qOrders = quarantine.batchOrders(db, batchId);
+  const controlled = qOrders.length > 0;
   const rollRows = db.prepare(
     `SELECT lr.id, lr.roll_code, lr.status, lr.print_qty, lr.applied_qty,
             lr.void_qty, lr.revision,
@@ -415,7 +423,7 @@ function batchBalance(db, batchId) {
   ).all(batchId);
 
   const rolls = rollRows.map((r) => {
-    const available = r.status === 'ACTIVE'
+    const available = (!controlled && r.status === 'ACTIVE')
       ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
       : 0;
     return {
@@ -434,6 +442,15 @@ function batchBalance(db, batchId) {
   return {
     batch_id: batch.id,
     batch_code: batch.code,
+    // 当前是否处于质量隔离令生效范围（此时逐卷可出货与合计均为 0）。
+    quarantined: controlled,
+    quarantine_orders: qOrders.map((o) => ({
+      order_id: o.order_id,
+      order_code: o.order_code,
+      lot_code: o.lot_code,
+      material_name: o.material_name,
+      classification: o.classification
+    })),
     shippable_qty: rolls.reduce((s, r) => s + r.available_qty, 0),
     applied_qty: rolls.reduce((s, r) => s + r.applied_qty, 0),
     allocated_qty: rolls.reduce((s, r) => s + r.allocated_qty, 0),

@@ -6,6 +6,9 @@
 //         批号不存在/缺原因/缺操作人明确拒绝；
 //   受控约束：不得登记放行/标签卷/出货；已有卷暂停贴用但不永久停用；
 //         关联已出货单转待评估；有效的继续流转结论转需重评；隔离期间只能召回；
+//   读侧统一：受控批次余额接口（单个/全部）与整页状态逐卷可出货及批次合计均为 0
+//         （已贴/已分配/卷状态/历史出货原值保留）；脱离全部生效令后恢复，
+//         停用卷始终为 0，待评估单仍占用原分配量；
 //   范围刷新：事件新增/更正、断网补录、整组换线后同步刷新（响应附 quarantine 变化）；
 //   解除：记录原因/操作人/时间；脱离所有生效令后才恢复后续操作；
 //         待评估单与历史处置不自动恢复；重复解除明确拒绝；解除后可重新签发；
@@ -187,6 +190,37 @@ async function main() {
     check('受控批次确认出货 → 409 BATCH_QUARANTINED',
       r.status === 409 && r.json.code === 'BATCH_QUARANTINED', r.json);
 
+    // ---------- 2b. 读侧统一：受控批次逐卷与合计可出货量均为 0 ----------
+    console.log('2b) 读侧统一：余额接口/整页状态逐卷可出货与批次合计均为 0（已贴/已分配/状态/历史原值）');
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('受控批次余额合计为 0 且标记 quarantined',
+      r.status === 200 && r.json.shippable_qty === 0 && r.json.quarantined === true &&
+      r.json.quarantine_orders.some((o) => o.order_code === 'QUAR-0001'), r.json);
+    check('逐卷可出货为 0，已贴/已分配/卷状态保持原值',
+      r.json.rolls[0].available_qty === 0 && r.json.rolls[0].applied_qty === 120 &&
+      r.json.rolls[0].allocated_qty === 100 && r.json.rolls[0].status === 'ACTIVE' &&
+      r.json.applied_qty === 120 && r.json.allocated_qty === 100, r.json.rolls);
+    r = await api('GET', '/api/shipment-balances');
+    const balB3 = r.json.find((x) => x.batch_code === 'BATCH-003');
+    const balB2 = r.json.find((x) => x.batch_code === 'BATCH-002');
+    check('全部余额接口同样归零（BATCH-003）',
+      balB3 && balB3.shippable_qty === 0 && balB3.quarantined === true, balB3);
+    check('BATCH-002 同属受控（无卷，合计 0）',
+      balB2 && balB2.quarantined === true && balB2.shippable_qty === 0, balB2);
+    const stQ = await state();
+    const rollQ0 = stQ.label_rolls.find((x) => x.roll_code === 'LABEL-0001');
+    check('整页状态 shippable_qty 归零（已贴/已分配/状态原值）',
+      rollQ0.shippable_qty === 0 && rollQ0.applied_qty === 120 &&
+      rollQ0.allocated_qty === 100 && rollQ0.status === 'ACTIVE' &&
+      rollQ0.quarantine_paused === true, rollQ0);
+    r = await api('GET', '/api/shipments/SHIP-0001');
+    check('历史出货记录保持原值（数量与明细不变）',
+      r.json.ship_qty === 100 && r.json.items.length === 1 &&
+      r.json.items[0].qty === 100 && r.json.items[0].roll_code === 'LABEL-0001', r.json);
+    r = await api('GET', '/api/batches/999999/shipment-balance');
+    check('批次不存在的余额查询仍 → 400 BATCH_NOT_FOUND',
+      r.status === 400 && r.json.code === 'BATCH_NOT_FOUND', r.json);
+
     // ---------- 3. 隔离期间只能召回 ----------
     console.log('3) 评估视图：隔离中只能召回，CONTINUE 被拒、RECALL 落账');
     r = await api('GET', '/api/shipments/SHIP-0001/evaluation');
@@ -266,6 +300,10 @@ async function main() {
     check('解除蛋令成功但无批次脱离（奶令仍覆盖）',
       r.status === 200 && r.json.order.status === 'LIFTED' &&
       r.json.quarantine.released.length === 0, r.json.quarantine);
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('多令覆盖时解除一张不恢复：余额仍为 0',
+      r.json.quarantined === true && r.json.shippable_qty === 0 &&
+      r.json.quarantine_orders.some((o) => o.order_code === 'QUAR-0001'), r.json);
     r = await api('POST', '/api/releases',
       { batch_id: B2, released_at: '2026-10-02T10:00', released_by: '王敏' });
     check('仍被奶令覆盖：BATCH-002 不得放行', r.status === 409);
@@ -283,6 +321,13 @@ async function main() {
       r.json.order.lifted_at === '2026-10-03T10:00' &&
       r.json.order.lift_reason.includes('复检合格') &&
       r.json.order.lifted_scope.length === 2, r.json.order);
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('脱离全部生效令后余额恢复（未停用卷 已贴120 − 已分配100 = 20）',
+      r.json.quarantined === false && r.json.quarantine_orders.length === 0 &&
+      r.json.shippable_qty === 20 && r.json.rolls[0].available_qty === 20, r.json);
+    const stLift = await state();
+    check('整页状态可出货同步恢复为 20',
+      stLift.label_rolls.find((x) => x.roll_code === 'LABEL-0001').shippable_qty === 20);
     r = await api('POST', `/api/quarantine-orders/${QUAR1}/lift`, {
       lifted_by: '刘芳', lift_reason: '重复解除'
     });
@@ -312,10 +357,18 @@ async function main() {
     check('解除后同一批号可重新签发（QUAR-0003）',
       r.status === 200 && r.json.order.order_code === 'QUAR-0003', r.json);
     const QUAR3 = r.json.order.id;
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('重新签发后余额再次归零（逐卷与合计）',
+      r.json.quarantined === true && r.json.shippable_qty === 0 &&
+      r.json.rolls[0].available_qty === 0, r.json);
     r = await api('POST', `/api/quarantine-orders/${QUAR3}/lift`, {
       lifted_by: '刘芳', lift_reason: '误报解除'
     });
     check('再次解除成功', r.status === 200 && r.json.order.status === 'LIFTED');
+    r = await api('GET', `/api/batches/${B3}/shipment-balance`);
+    check('再次脱离后余额恢复（已贴121 − 已分配100 = 21），待评估单仍占用原分配量',
+      r.json.quarantined === false && r.json.shippable_qty === 21 &&
+      r.json.applied_qty === 121 && r.json.allocated_qty === 100, r.json);
 
     // ---------- 6. 有效的继续流转结论转需重评 ----------
     console.log('6) 签发级联：有效 CONTINUE 结论转需重评（原子完成），隔离中只能召回');
@@ -374,6 +427,11 @@ async function main() {
       r.json.stale_dispositions[0].reason.includes('质量隔离令'),
       r.json.stale_dispositions);
     const QUAR4 = r.json.order.id;
+    r = await api('GET', `/api/batches/${B_Q1}/shipment-balance`);
+    check('小麦令覆盖 BATCH-Q1：余额归零（卷已停用，已贴/已分配原值保留）',
+      r.json.quarantined === true && r.json.shippable_qty === 0 &&
+      r.json.applied_qty === 10 && r.json.allocated_qty === 5 &&
+      r.json.rolls[0].status === 'RETIRED', r.json);
     r = await api('GET', `/api/shipments/${SHIP_Q}/evaluation`);
     check('评估视图：旧结论 STALE（需重新评估）且隔离中只能召回',
       r.json.current_disposition.life_status === 'STALE' &&
@@ -389,6 +447,11 @@ async function main() {
       lifted_by: '刘芳', lift_reason: '异物排查排除'
     });
     check('解除小麦令', r.status === 200, r.json);
+    r = await api('GET', `/api/batches/${B_Q1}/shipment-balance`);
+    check('解除后停用卷可出货始终为 0，待评估单仍占用原分配量',
+      r.json.quarantined === false && r.json.shippable_qty === 0 &&
+      r.json.rolls[0].status === 'RETIRED' && r.json.rolls[0].available_qty === 0 &&
+      r.json.allocated_qty === 5, r.json);
     r = await api('GET', `/api/shipments/${SHIP_Q}`);
     check('待评估单与历史处置不自动恢复',
       r.json.status === 'PENDING_REVIEW' &&
